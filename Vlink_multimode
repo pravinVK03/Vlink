@@ -1,0 +1,1008 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <NimBLEDevice.h>
+#include <NimBLEHIDDevice.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+#define BATTERY_PIN 39
+const float DIV_RATIO = 2.0;
+const float ADC_REF = 3.3;
+const int ADC_RES = 4095;
+const float BATT_MIN = 3.0;
+const float BATT_MAX = 4.2;
+const int BATT_SAMPLES = 20;
+#define BATT_SMOOTH 0.95
+
+Adafruit_MPU6050 mpu;
+
+#define FLEX_INDEX 34
+#define FLEX_MIDDLE 35
+#define FLEX_THUMB 36
+#define FLEX_RING 32
+#define FLEX_PINKY 33
+
+int FLEX_INDEX_THRESH = 50;
+int FLEX_MIDDLE_THRESH = 150;
+int FLEX_THUMB_THRESH = 250;
+int FLEX_RING_THRESH = 50;
+int FLEX_PINKY_THRESH = 150;
+
+#define GYRO_DEAD 0.20
+#define CURSOR_SENSITIVITY 8.0
+#define MOTION_THRESHOLD 0.3
+#define SCROLL_SENSITIVITY 1.2
+#define SCROLL_TILT_DEAD 0.25
+
+#define STEER_SENSITIVITY 15.0
+#define STEER_DEAD 0.15
+#define TILT_UP_THRESH -0.4
+#define TILT_DOWN_THRESH 0.4
+
+float gyroYawOffset = 0;
+float gyroPitchOffset = 0;
+float gyroRollOffset = 0;
+
+unsigned long lastUpdate = 0;
+
+NimBLEHIDDevice* hid;
+NimBLECharacteristic* inputMouse;
+NimBLECharacteristic* inputKeyboard;
+NimBLECharacteristic* outputKeyboard;
+
+bool bleConnected = false;
+
+static const uint8_t MOUSE_REPORT_MAP[] = {
+  0x05, 0x01,        
+  0x09, 0x02,      
+  0xA1, 0x01,       
+  0x09, 0x01,       
+  0xA1, 0x00,
+  0x05, 0x09,        
+  0x19, 0x01,        
+  0x29, 0x03,        
+  0x15, 0x00,       
+  0x25, 0x01,        
+  0x95, 0x03,        
+  0x75, 0x01,       
+  0x81, 0x02,       
+  0x95, 0x01,        
+  0x75, 0x05,       
+  0x81, 0x01,     
+  0x05, 0x01,       
+  0x09, 0x30,        
+  0x09, 0x31,        
+  0x09, 0x38,        
+  0x15, 0x81,        
+  0x25, 0x7F,        
+  0x75, 0x08,       
+  0x95, 0x03,       
+  0x81, 0x06,        
+  0xC0,             
+  0xC0
+};
+
+static const uint8_t KEYBOARD_REPORT_MAP[] = {
+  0x05, 0x01,       
+  0x09, 0x06,        
+  0xA1, 0x01,        
+  0x05, 0x07,        
+  0x19, 0xE0,       
+  0x29, 0xE7,       
+  0x15, 0x00,      
+  0x25, 0x01,        
+  0x75, 0x01,        
+  0x95, 0x08,        
+  0x81, 0x02,        
+  0x95, 0x01,
+  0x75, 0x08,      
+  0x81, 0x01,        
+  0x95, 0x06,       
+  0x75, 0x08,        
+  0x15, 0x00,       
+  0x25, 0x65,        
+  0x05, 0x07,        
+  0x19, 0x00,      
+  0x29, 0x65,       
+  0x81, 0x00,       
+  0xC0               
+};
+
+uint8_t mouseReport[4] = {0, 0, 0, 0}; // buttons, x, y, wheel
+uint8_t keyboardReport[8] = {0};        // modifiers, reserved, key1-6
+
+#define KEY_LEFT_ARROW 0x50
+#define KEY_RIGHT_ARROW 0x4F
+#define KEY_UP_ARROW 0x52
+#define KEY_DOWN_ARROW 0x51
+#define KEY_ESC 0x29
+#define KEY_F5 0x3E
+#define KEY_SPACE 0x2C
+
+#define KEY_MEDIA_PLAY_PAUSE 0xCD
+#define KEY_MEDIA_VOLUME_UP 0xE9
+#define KEY_MEDIA_VOLUME_DOWN 0xEA
+#define KEY_MEDIA_NEXT_TRACK 0xB5
+#define KEY_MEDIA_PREVIOUS_TRACK 0xB6
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer) {
+    bleConnected = true;
+    Serial.println("✓ BLE Connected");
+  }
+
+  void onDisconnect(NimBLEServer* pServer) {
+    bleConnected = false;
+    Serial.println("✗ BLE Disconnected");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+enum ControlMode {
+  MODE_MOUSE = 0,
+  MODE_PRESENTATION = 1,
+  MODE_MEDIA = 2,
+  MODE_GAME_ASPHALT = 3
+};
+
+ControlMode currentMode = MODE_MOUSE;
+const char* modeNames[] = {"Mouse", "Present", "Media", "Asphalt 8"};
+
+unsigned long allFingersStartTime = 0;
+bool modeSwitchPending = false;
+bool modeJustSwitched = false;
+unsigned long modeSwitchDisplayTime = 0;
+
+bool leftPressed = false;
+bool rightPressed = false;
+bool dragging = false;
+bool scrolling = false;
+
+bool presenting = false;
+
+bool mediaControlActive = false;
+
+bool nitroActive = false;
+bool driftActive = false;
+bool upPressed = false;
+bool downPressed = false;
+int lastSteerValue = 0;
+
+float smoothedBatteryVoltage = 0;
+
+
+void sendMouseReport(uint8_t buttons, int8_t x, int8_t y, int8_t wheel) {
+  if (!bleConnected || !inputMouse) return;
+  
+  uint8_t report[5]; 
+  report[0] = 0x01;  
+  report[1] = buttons;
+  report[2] = x;
+  report[3] = y;
+  report[4] = wheel;
+  
+  inputMouse->setValue(report, 5);
+  inputMouse->notify();
+}
+
+void sendKeyPress(uint8_t key) {
+  if (!bleConnected || !inputKeyboard) return;
+  
+  uint8_t report[9]; // Report ID + 8 bytes
+  report[0] = 0x02;  // Report ID for Keyboard
+  memset(&report[1], 0, 8);
+  report[3] = key;   // First key slot
+  
+  inputKeyboard->setValue(report, 9);
+  inputKeyboard->notify();
+  delay(10);
+  
+  memset(&report[1], 0, 8);
+  inputKeyboard->setValue(report, 9);
+  inputKeyboard->notify();
+}
+
+void pressKey(uint8_t key) {
+  if (!bleConnected || !inputKeyboard) return;
+  
+  uint8_t report[9];
+  report[0] = 0x02;  // Report ID for Keyboard
+  
+  memcpy(&report[1], keyboardReport, 8);
+  
+  for (int i = 2; i < 8; i++) {
+    if (report[i] == 0) {
+      report[i] = key;
+      break;
+    }
+  }
+  
+  memcpy(keyboardReport, &report[1], 8);
+  
+  inputKeyboard->setValue(report, 9);
+  inputKeyboard->notify();
+}
+
+void releaseKey(uint8_t key) {
+  if (!bleConnected || !inputKeyboard) return;
+  
+  uint8_t report[9];
+  report[0] = 0x02;  
+  memcpy(&report[1], keyboardReport, 8);
+  
+  for (int i = 2; i < 8; i++) {
+    if (report[i] == key) {
+      report[i] = 0;
+      break;
+    }
+  }
+  
+  // Update state
+  memcpy(keyboardReport, &report[1], 8);
+  
+  inputKeyboard->setValue(report, 9);
+  inputKeyboard->notify();
+}
+
+void releaseAllKeys() {
+  if (!bleConnected || !inputKeyboard) return;
+  
+  uint8_t report[9];
+  report[0] = 0x02;  // Report ID for Keyboard
+  memset(&report[1], 0, 8);
+  memset(keyboardReport, 0, 8);
+  
+  inputKeyboard->setValue(report, 9);
+  inputKeyboard->notify();
+}
+
+// ===== Battery Functions =====
+float readBatteryVoltage() {
+  float sum = 0;
+  for (int i = 0; i < BATT_SAMPLES; i++) {
+    int raw = analogRead(BATTERY_PIN);
+    sum += (raw * ADC_REF / ADC_RES) * DIV_RATIO;
+    delayMicroseconds(100);
+  }
+  float voltage = sum / BATT_SAMPLES;
+  
+  if (smoothedBatteryVoltage == 0) {
+    smoothedBatteryVoltage = voltage;
+  } else {
+    smoothedBatteryVoltage = (smoothedBatteryVoltage * BATT_SMOOTH) + (voltage * (1.0 - BATT_SMOOTH));
+  }
+  
+  return smoothedBatteryVoltage;
+}
+
+int getBatteryPercent() {
+  float voltage = readBatteryVoltage();
+  int percent = (int)((voltage - BATT_MIN) / (BATT_MAX - BATT_MIN) * 100.0);
+  return constrain(percent, 0, 100);
+}
+
+void drawBatteryIcon(int x, int y, int percent) {
+  display.drawRect(x, y, 12, 7, SSD1306_WHITE);
+  display.fillRect(x + 12, y + 2, 2, 3, SSD1306_WHITE);
+  
+  int fillWidth = map(percent, 0, 100, 0, 10);
+  
+  if (fillWidth > 0) {
+    display.fillRect(x + 1, y + 1, fillWidth, 5, SSD1306_WHITE);
+  }
+  
+  if (percent < 20 && (millis() / 500) % 2 == 0) {
+    display.drawRect(x, y, 12, 7, SSD1306_WHITE);
+  }
+}
+
+// ===== Calibration =====
+bool calibrateGyro() {
+  const int samples = 200;
+  float sumYaw = 0, sumPitch = 0, sumRoll = 0;
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(10, 20);
+  display.println("Calibrating...");
+  display.setCursor(10, 35);
+  display.println("Keep still!");
+  display.display();
+  
+  delay(500);
+  
+  for (int i = 0; i < samples; i++) {
+    sensors_event_t a, g, t;
+    if (!mpu.getEvent(&a, &g, &t)) {
+      Serial.println("ERROR: Failed to read MPU during calibration!");
+      return false;
+    }
+    sumYaw += g.gyro.z;
+    sumPitch += g.gyro.y;
+    sumRoll += g.gyro.x;
+    delay(5);
+  }
+  
+  gyroYawOffset = sumYaw / samples;
+  gyroPitchOffset = sumPitch / samples;
+  gyroRollOffset = sumRoll / samples;
+  
+  Serial.printf("✓ Gyro Calibrated - Yaw:%.3f Pitch:%.3f Roll:%.3f\n", 
+                gyroYawOffset, gyroPitchOffset, gyroRollOffset);
+  return true;
+}
+
+// ===== Display Functions =====
+void showStatus(const char* msg) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(msg, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, (SCREEN_HEIGHT - h) / 2);
+  display.println(msg);
+  
+  display.setTextSize(1);
+  int battPct = getBatteryPercent();
+  display.setCursor(82, 2);
+  display.printf("%d%%", battPct);
+  drawBatteryIcon(108, 2, battPct);
+  
+  display.display();
+}
+
+void displayModeSwitch() {
+  display.clearDisplay();
+  
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  int battPct = getBatteryPercent();
+  display.setCursor(82, 2);
+  display.printf("%d%%", battPct);
+  drawBatteryIcon(108, 2, battPct);
+  
+  display.setTextSize(2);
+  display.setCursor(10, 15);
+  display.print("Switched!");
+  
+  display.setTextSize(1);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(modeNames[currentMode], 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 40);
+  display.print(modeNames[currentMode]);
+  
+  display.display();
+}
+
+// ===== Mode Switching =====
+void switchMode() {
+  // Reset all states
+  sendMouseReport(0, 0, 0, 0);
+  releaseAllKeys();
+  
+  leftPressed = false;
+  rightPressed = false;
+  dragging = false;
+  scrolling = false;
+  nitroActive = false;
+  driftActive = false;
+  upPressed = false;
+  downPressed = false;
+  lastSteerValue = 0;
+  
+  // Cycle to next mode
+  currentMode = (ControlMode)((currentMode + 1) % 4);
+  
+  modeJustSwitched = true;
+  modeSwitchDisplayTime = millis();
+  
+  Serial.printf("→ MODE SWITCHED TO: %s\n", modeNames[currentMode]);
+  displayModeSwitch();
+  delay(1500);
+}
+
+void checkModeSwitchGesture(bool iBent, bool mBent, bool tBent, bool rBent, bool pBent) {
+  bool allBent = iBent && mBent && tBent && rBent && pBent;
+  
+  if (allBent && !modeSwitchPending) {
+    modeSwitchPending = true;
+    allFingersStartTime = millis();
+    Serial.println("→ Mode switch gesture detected...");
+  } else if (!allBent && modeSwitchPending) {
+    modeSwitchPending = false;
+    Serial.println("→ Mode switch cancelled");
+  }
+  
+  if (modeSwitchPending && (millis() - allFingersStartTime >= 5000)) {
+    switchMode();
+    modeSwitchPending = false;
+  }
+}
+
+// ===== Mode Handlers =====
+void handleMouseMode(float yawRate, float pitchRate, float rollRate, 
+                     bool iBent, bool mBent, bool tBent, bool rBent, bool pBent) {
+  
+  int8_t moveX = 0;
+  int8_t moveY = 0;
+  uint8_t buttons = 0;
+  int8_t wheel = 0;
+  
+  // Cursor movement
+  if (fabs(yawRate) > MOTION_THRESHOLD) {
+    moveX = constrain((int8_t)(yawRate * CURSOR_SENSITIVITY), -127, 127);
+  }
+  if (fabs(pitchRate) > MOTION_THRESHOLD) {
+    moveY = constrain((int8_t)(-pitchRate * CURSOR_SENSITIVITY), -127, 127);
+  }
+  
+  // Drag mode (Thumb only)
+  if (tBent && !dragging) {
+    leftPressed = false;
+    rightPressed = false;
+    scrolling = false;
+    dragging = true;
+    Serial.println("→ DRAG START");
+  } else if (!tBent && dragging) {
+    dragging = false;
+    Serial.println("→ DRAG END");
+  }
+
+  // Scroll mode (Pinky)
+  if (pBent && !scrolling && !dragging) {
+    scrolling = true;
+    Serial.println("→ SCROLL MODE ON");
+  } else if (!pBent && scrolling) {
+    scrolling = false;
+    Serial.println("→ SCROLL MODE OFF");
+  }
+  
+  // Scrolling
+  if (scrolling) {
+    if (fabs(pitchRate) > SCROLL_TILT_DEAD) {
+      wheel = constrain((int8_t)(-pitchRate * SCROLL_SENSITIVITY), -5, 5);
+    }
+  }
+
+  if (!dragging && !scrolling) {
+    // Left click (Index only)
+    if (iBent && !mBent) {
+      if (!leftPressed) {
+        leftPressed = true;
+        Serial.println("→ LEFT CLICK");
+      }
+      buttons |= 0x01;
+    } else {
+      leftPressed = false;
+    }
+
+    // Right click (Middle only)
+    if (mBent && !iBent) {
+      if (!rightPressed) {
+        rightPressed = true;
+        Serial.println("→ RIGHT CLICK");
+      }
+      buttons |= 0x02;
+    } else {
+      rightPressed = false;
+    }
+  } else if (dragging) {
+    buttons |= 0x01; // Hold left button during drag
+  }
+
+  sendMouseReport(buttons, moveX, moveY, wheel);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  int battPct = getBatteryPercent();
+  display.setCursor(82, 2);
+  display.printf("%d%%", battPct);
+  drawBatteryIcon(108, 2, battPct);
+  
+  display.setTextSize(2);
+  display.setCursor(5, 15);
+  display.print("Mouse Mode");
+  
+  display.setTextSize(1);
+  String control = "";
+  if (scrolling) control = "SCROLL";
+  else if (dragging) control = "DRAG";
+  else if (leftPressed) control = "LEFT CLICK";
+  else if (rightPressed) control = "RIGHT CLICK";
+  else control = "Ready";
+  
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(control.c_str(), 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 38);
+  display.print(control);
+  display.display();
+}
+
+void handlePresentationMode(float yawRate, float pitchRate, 
+                           bool iBent, bool mBent, bool tBent, bool rBent, bool pBent) {
+
+  static bool nextPressed = false;
+  if (iBent && !nextPressed && !mBent) {
+    sendKeyPress(KEY_RIGHT_ARROW);
+    nextPressed = true;
+    Serial.println("→ NEXT SLIDE");
+  } else if (!iBent && nextPressed) {
+    nextPressed = false;
+  }
+
+  static bool prevPressed = false;
+  if (mBent && !prevPressed && !iBent) {
+    sendKeyPress(KEY_LEFT_ARROW);
+    prevPressed = true;
+    Serial.println("→ PREV SLIDE");
+  } else if (!mBent && prevPressed) {
+    prevPressed = false;
+  }
+
+  static bool presToggle = false;
+  if (tBent && !presToggle) {
+    if (!presenting) {
+      sendKeyPress(KEY_F5);
+      presenting = true;
+      Serial.println("→ START PRESENTATION");
+    } else {
+      sendKeyPress(KEY_ESC);
+      presenting = false;
+      Serial.println("→ STOP PRESENTATION");
+    }
+    presToggle = true;
+  } else if (!tBent && presToggle) {
+    presToggle = false;
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  int battPct = getBatteryPercent();
+  display.setCursor(82, 2);
+  display.printf("%d%%", battPct);
+  drawBatteryIcon(108, 2, battPct);
+  
+  display.setTextSize(2);
+  display.setCursor(5, 15);
+  display.print("Present");
+  
+  display.setTextSize(1);
+  String status = "";
+  if (nextPressed) status = "Next Slide";
+  else if (prevPressed) status = "Prev Slide";
+  else if (presenting) status = "Presenting";
+  else status = "Ready";
+  
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(status.c_str(), 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 38);
+  display.print(status);
+  display.display();
+}
+
+void handleMediaMode(float yawRate, float pitchRate,
+                    bool iBent, bool mBent, bool tBent, bool rBent, bool pBent) {
+  
+  static bool playPauseToggle = false;
+  if (tBent && !playPauseToggle) {
+    sendKeyPress(KEY_SPACE);
+    playPauseToggle = true;
+    Serial.println("→ PLAY/PAUSE");
+  } else if (!tBent && playPauseToggle) {
+    playPauseToggle = false;
+  }
+  
+  static bool volUpActive = false;
+  if (iBent && !volUpActive) {
+    sendKeyPress(KEY_UP_ARROW);
+    volUpActive = true;
+    Serial.println("→ VOLUME UP");
+  } else if (!iBent && volUpActive) {
+    volUpActive = false;
+  }
+  
+  static bool volDownActive = false;
+  if (mBent && !volDownActive) {
+    sendKeyPress(KEY_DOWN_ARROW);
+    volDownActive = true;
+    Serial.println("→ VOLUME DOWN");
+  } else if (!mBent && volDownActive) {
+    volDownActive = false;
+  }
+
+  static bool nextTrack = false;
+  if (rBent && !nextTrack) {
+    sendKeyPress(KEY_RIGHT_ARROW);
+    nextTrack = true;
+    Serial.println("→ NEXT TRACK");
+  } else if (!rBent && nextTrack) {
+    nextTrack = false;
+  }
+
+  static bool prevTrack = false;
+  if (pBent && !prevTrack) {
+    sendKeyPress(KEY_LEFT_ARROW);
+    prevTrack = true;
+    Serial.println("→ PREV TRACK");
+  } else if (!pBent && prevTrack) {
+    prevTrack = false;
+  }
+
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  int battPct = getBatteryPercent();
+  display.setCursor(82, 2);
+  display.printf("%d%%", battPct);
+  drawBatteryIcon(108, 2, battPct);
+  
+  display.setTextSize(2);
+  display.setCursor(5, 15);
+  display.print("Media");
+  
+  display.setTextSize(1);
+  String action = "";
+  if (playPauseToggle) action = "Play/Pause";
+  else if (volUpActive) action = "Vol Up";
+  else if (volDownActive) action = "Vol Down";
+  else if (nextTrack) action = "Next Track";
+  else if (prevTrack) action = "Prev Track";
+  else action = "Ready";
+  
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(action.c_str(), 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 38);
+  display.print(action);
+  display.display();
+}
+
+void handleAsphalt8Mode(float yawRate, float pitchRate, float rollRate,
+                       bool iBent, bool mBent, bool tBent, bool rBent, bool pBent) {
+
+  if (tBent && !nitroActive) {
+    pressKey(KEY_UP_ARROW);
+    nitroActive = true;
+    Serial.println("→ NITRO ON");
+  } else if (!tBent && nitroActive) {
+    releaseKey(KEY_UP_ARROW);
+    nitroActive = false;
+    Serial.println("→ NITRO OFF");
+  }
+  
+  bool wantDrift = iBent && mBent;
+  if (wantDrift && !driftActive) {
+    pressKey(KEY_SPACE);
+    driftActive = true;
+    Serial.println("→ DRIFT ON");
+  } else if (!wantDrift && driftActive) {
+    releaseKey(KEY_SPACE);
+    driftActive = false;
+    Serial.println("→ DRIFT OFF");
+  }
+  
+  if (!nitroActive) {
+    if (pitchRate < TILT_UP_THRESH && !upPressed) {
+      pressKey(KEY_UP_ARROW);
+      upPressed = true;
+      Serial.println("→ UP ARROW");
+    } else if (pitchRate >= TILT_UP_THRESH && upPressed) {
+      releaseKey(KEY_UP_ARROW);
+      upPressed = false;
+    }
+    
+    if (pitchRate > TILT_DOWN_THRESH && !downPressed) {
+      pressKey(KEY_DOWN_ARROW);
+      downPressed = true;
+      Serial.println("→ DOWN ARROW");
+    } else if (pitchRate <= TILT_DOWN_THRESH && downPressed) {
+      releaseKey(KEY_DOWN_ARROW);
+      downPressed = false;
+    }
+  }
+  
+  // Roll: Steering (Left/Right arrows)
+  int steerValue = 0;
+  if (fabs(rollRate) > STEER_DEAD) {
+    steerValue = constrain((int)(rollRate * STEER_SENSITIVITY), -3, 3);
+  }
+  
+  if (steerValue < 0) {
+    pressKey(KEY_LEFT_ARROW);
+    if (lastSteerValue >= 0) releaseKey(KEY_RIGHT_ARROW);
+  } else if (steerValue > 0) {
+    pressKey(KEY_RIGHT_ARROW);
+    if (lastSteerValue <= 0) releaseKey(KEY_LEFT_ARROW);
+  } else {
+    releaseKey(KEY_LEFT_ARROW);
+    releaseKey(KEY_RIGHT_ARROW);
+  }
+  lastSteerValue = steerValue;
+
+ 
+  display.clearDisplay();
+  display.setTextSize(1);
+  int battPct = getBatteryPercent();
+  display.setCursor(82, 2);
+  display.printf("%d%%", battPct);
+  drawBatteryIcon(108, 2, battPct);
+  
+  display.setTextSize(2);
+  display.setCursor(5, 15);
+  display.print("Asphalt 8");
+  
+  display.setTextSize(1);
+  String state = "";
+  if (nitroActive) state = "NITRO!";
+  else if (driftActive) state = "DRIFT";
+  else if (upPressed) state = "Accelerate";
+  else if (downPressed) state = "Brake";
+  else if (steerValue < 0) state = "Steer Left";
+  else if (steerValue > 0) state = "Steer Right";
+  else state = "Ready";
+  
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(state.c_str(), 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 38);
+  display.print(state);
+  display.display();
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== Vlink Controller (NimBLE) ===");
+  
+  Wire.begin();
+  Wire.setClock(400000);
+  
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  
+  // Initialize Display
+  Serial.print("Initializing Display... ");
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("FAILED!");
+    while (1) delay(1000);
+  }
+  Serial.println("OK");
+  
+  display.clearDisplay();
+  display.setTextSize(3);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(25, 20);
+  display.println("Vlink");
+  display.display();
+  delay(2000);
+
+  Serial.print("Initializing MPU6050... ");
+  if (!mpu.begin(0x68)) {
+    Serial.println("FAILED at 0x68!");
+    Serial.print("Trying 0x69... ");
+    if (!mpu.begin(0x69)) {
+      Serial.println("FAILED!");
+      showStatus("MPU ERR");
+      while (1) delay(1000);
+    }
+  }
+  Serial.println("OK");
+  
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  Serial.print("Calibrating Gyro... ");
+  if (!calibrateGyro()) {
+    Serial.println("FAILED!");
+    showStatus("CAL ERR");
+    while (1) delay(1000);
+  }
+  Serial.println("OK");
+  
+  Serial.print("Starting NimBLE... ");
+  NimBLEDevice::init("Vlink");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9); // Max power for better range
+  
+  NimBLEServer* pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  hid = new NimBLEHIDDevice(pServer);
+
+  hid->setManufacturer("VisionLabs");
+  hid->setPnp(0x02, 0xe502, 0xa111, 0x0210); // BT, Vendor, Product, Version
+  hid->setHidInfo(0x00, 0x01); // Country, Flags
+  
+  const uint8_t COMBINED_REPORT_MAP[] = {
+    0x05, 0x01,        
+    0x09, 0x02,        
+    0xA1, 0x01,       
+    0x85, 0x01,       
+    0x09, 0x01,      
+    0xA1, 0x00,      
+    0x05, 0x09,        
+    0x19, 0x01,     
+    0x29, 0x03,        
+    0x15, 0x00,       
+    0x25, 0x01,        
+    0x95, 0x03,      
+    0x75, 0x01,       
+    0x81, 0x02,        
+    0x95, 0x01,       
+    0x75, 0x05,        
+    0x81, 0x01,       
+    0x05, 0x01,      
+    0x09, 0x30,        
+    0x09, 0x31,        
+    0x09, 0x38,        
+    0x15, 0x81,        
+    0x25, 0x7F,        
+    0x75, 0x08,        
+    0x95, 0x03,        
+    0x81, 0x06,        
+    0xC0,              
+    0xC0,              
+    
+    0x05, 0x01,        
+    0x09, 0x06,      
+    0x05, 0x07,        
+    0x19, 0xE0,        
+    0x29, 0xE7,        
+    0x15, 0x00,       
+    0x25, 0x01,        
+    0x75, 0x01,        
+    0x95, 0x08,        
+    0x81, 0x02,        
+    0x95, 0x01,        
+    0x75, 0x08,       
+    0x81, 0x01,        
+    0x95, 0x06,        
+    0x75, 0x08,        
+    0x15, 0x00,       
+    0x25, 0x65,       
+    0x05, 0x07,       
+    0x19, 0x00,        
+    0x29, 0x65,       
+    0x81, 0x00,        
+    0xC0              
+  };
+  
+  hid->setReportMap((uint8_t*)COMBINED_REPORT_MAP, sizeof(COMBINED_REPORT_MAP));
+
+  inputMouse = hid->getInputReport(1);
+  inputKeyboard = hid->getInputReport(2);
+
+  hid->startServices();
+
+  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->setAppearance(0x03C2); // HID Keyboard appearance
+  pAdvertising->addServiceUUID(hid->getHidService()->getUUID());
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setMinInterval(0x06); // Help with connections
+  pAdvertising->setMaxInterval(0x12);
+  pAdvertising->start();
+  
+  Serial.println("OK");
+  Serial.println("BLE Device Name: Vlink");
+  Serial.println("BLE Advertising started!");
+  
+  smoothedBatteryVoltage = readBatteryVoltage();
+  
+  showStatus("Ready");
+  delay(1000);
+  
+  lastUpdate = millis();
+  
+  Serial.println("=== System Ready ===");
+  Serial.printf("Free Heap: %d bytes\n", ESP.getFreeHeap());
+}
+
+void loop() {
+  if (!bleConnected) {
+    showStatus("Waiting");
+    delay(200);
+    return;
+  }
+
+  static bool shownConnected = false;
+  if (!shownConnected) {
+    showStatus("Connected");
+    delay(1000);
+    shownConnected = true;
+    Serial.println("✓ Device Connected");
+  }
+
+  sensors_event_t a, g, t;
+  if (!mpu.getEvent(&a, &g, &t)) {
+    Serial.println("ERROR: MPU read failed!");
+    delay(100);
+    return;
+  }
+  
+  unsigned long now = millis();
+  float dt = (now - lastUpdate) / 1000.0;
+  lastUpdate = now;
+
+  float yawRate = g.gyro.z - gyroYawOffset;
+  float pitchRate = g.gyro.y - gyroPitchOffset;
+  float rollRate = g.gyro.x - gyroRollOffset;
+  
+  if (fabs(yawRate) < GYRO_DEAD) yawRate = 0;
+  if (fabs(pitchRate) < GYRO_DEAD) pitchRate = 0;
+  if (fabs(rollRate) < GYRO_DEAD) rollRate = 0;
+
+  int fI = analogRead(FLEX_INDEX);
+  int fM = analogRead(FLEX_MIDDLE);
+  int fT = analogRead(FLEX_THUMB);
+  int fR = analogRead(FLEX_RING);
+  int fP = analogRead(FLEX_PINKY);
+
+  bool iBent = fI > FLEX_INDEX_THRESH;
+  bool mBent = fM > FLEX_MIDDLE_THRESH;
+  bool tBent = fT > FLEX_THUMB_THRESH;
+  bool rBent = fR > FLEX_RING_THRESH;
+  bool pBent = fP > FLEX_PINKY_THRESH;
+
+  checkModeSwitchGesture(iBent, mBent, tBent, rBent, pBent);
+
+  if (modeSwitchPending) {
+    unsigned long elapsed = millis() - allFingersStartTime;
+    int progress = map(elapsed, 0, 5000, 0, 100);
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    int battPct = getBatteryPercent();
+    display.setCursor(82, 2);
+    display.printf("%d%%", battPct);
+    drawBatteryIcon(108, 2, battPct);
+    
+    display.setTextSize(2);
+    display.setCursor(10, 15);
+    display.print("Switching");
+    
+    display.setTextSize(1);
+    display.setCursor(20, 40);
+    display.printf("Hold: %d%%", progress);
+    
+    display.drawRect(10, 52, 108, 8, SSD1306_WHITE);
+    int barWidth = map(progress, 0, 100, 0, 106);
+    display.fillRect(11, 53, barWidth, 6, SSD1306_WHITE);
+    
+    display.display();
+    delay(50);
+    return;
+  }
+
+  switch (currentMode) {
+    case MODE_MOUSE:
+      handleMouseMode(yawRate, pitchRate, rollRate, iBent, mBent, tBent, rBent, pBent);
+      break;
+      
+    case MODE_PRESENTATION:
+      handlePresentationMode(yawRate, pitchRate, iBent, mBent, tBent, rBent, pBent);
+      break;
+      
+    case MODE_MEDIA:
+      handleMediaMode(yawRate, pitchRate, iBent, mBent, tBent, rBent, pBent);
+      break;
+      
+    case MODE_GAME_ASPHALT:
+      handleAsphalt8Mode(yawRate, pitchRate, rollRate, iBent, mBent, tBent, rBent, pBent);
+      break;
+  }
+
+  delay(10);
+}
