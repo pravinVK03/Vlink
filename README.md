@@ -1,9 +1,13 @@
-# Vlink
+# Vlink <img width="100" height="100" alt="Vlink_logo" src="https://github.com/user-attachments/assets/e858d264-b5a8-43e8-bf3c-bdb1bcdbf632" /> 
+
 Smart Glove with Gesture-Based User Interaction
 The Smart Glove with Gesture-Based Interface is a wearable electronic device designed to interpret human generated 
 gestures into digital control commands, enabling natural, seamless human–computer interaction. It combines multiple 
 sensors, a microcontroller, wireless communication, and an intuitive user interface into a single compact and ergonomic 
-wearable glove system.
+wearable glove system as shown in Fig. 1.
+
+![WhatsApp Image 2026-01-25 at 9 32 30 AM](https://github.com/user-attachments/assets/707bd6a1-cb79-4528-8321-8c3fe8004199)
+Fig. 1
 
 The Smart Glove with Gesture-Based Interface operates on the principle of motion and flex sensing, translating hand and 
 finger gestures into digital control commands for human–computer interaction. 
@@ -19,6 +23,9 @@ microcontroller, when the gesture generated is mapped to the stored gesture patt
 as hand motion for cursor navigation, index finger and middle finger for mouse clicks, tilt for gaming control and other 
 gestures for presentation control etc., . Visual feedback of triggered commands is provided on the OLED to confirm the 
 detected gesture and operation mode.
+
+<img width="892" height="838" alt="image" src="https://github.com/user-attachments/assets/aa6cfa23-650f-4b34-a165-af4c39390a9f" />
+
 
 This intuitive system framework enables natural, creative, and intuitive control over computer systems for humans bridging 
 the gap between the virtual world and real world. 
