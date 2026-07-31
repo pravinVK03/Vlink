@@ -24,8 +24,7 @@ as hand motion for cursor navigation, index finger and middle finger for mouse c
 gestures for presentation control etc., . Visual feedback of triggered commands is provided on the OLED to confirm the 
 detected gesture and operation mode.
 
-<img width="892" height="838" alt="image" src="https://github.com/user-attachments/assets/aa6cfa23-650f-4b34-a165-af4c39390a9f" />
-
+<img width="1159" height="1358" alt="Vlink Operational Flow" src="https://github.com/user-attachments/assets/daba0e11-2cd6-41f2-8afc-a1c30d902fe0" />
 
 This intuitive system framework enables natural, creative, and intuitive control over computer systems for humans bridging 
 the gap between the virtual world and real world. 
